@@ -924,38 +924,99 @@ class __named_rule_until {
   // uses a string rule, make sure we have all the transitions populated for at
   // least 2 years after the start of the last continuation.
   //
-  // Note that the end of the second to last continuation is the start of the last
-  // continuation, and the last continuation is used forever.
+  // Note that the end of the second to last continuation is the start of the
+  // last continuation, and the last continuation is used forever.
   const auto& continuations = result.__impl_->__continuations();
   auto& transitions = result.__impl_->transitions();
   auto& ttinfos = result.__impl_->ttinfos();
-  if (continuations.size() > 1 &&
-      (std::holds_alternative<std::string>(continuations[continuations.size() - 2].__rules) || std::holds_alternative<std::string>(continuations[continuations.size() - 1].__rules))) {
-    const auto endTime = __until_to_sys_seconds(continuations[continuations.size() - 2]) + date::years(2);
-    if (endTime > transitions.back().timepoint) {
-      auto sys_info = result.__get_info_to_populate_transition(transitions.back().timepoint);
-      auto max = date::sys_seconds::max();
-      while ((sys_info.end < max) && (endTime > transitions.back().timepoint)) {
-        sys_info = result.__get_info_to_populate_transition(sys_info.end);
-        ttinfos.emplace_back(sys_info.offset, sys_info.abbrev, sys_info.save > std::chrono::minutes(0));
-        transitions.emplace_back(sys_info.end, &ttinfos.back());
+
+  auto addTransition = [&](date::sys_seconds time, const sys_info& info) {
+    const bool isDst = info.save != std::chrono::minutes{0};
+    auto ttinfo = std::find_if(
+        ttinfos.begin(),
+        ttinfos.end(),
+        [&](const date::expanded_ttinfo& candidate) {
+          return candidate.offset == info.offset &&
+              candidate.abbrev == info.abbrev && candidate.is_dst == isDst;
+        });
+
+    if (ttinfo == ttinfos.end()) {
+      // Transitions hold pointers into ttinfos. Preserve their indices across
+      // a vector reallocation so the pointers can be rebound afterwards.
+      const bool reallocate = ttinfos.size() == ttinfos.capacity();
+      std::vector<size_t> infoIndices;
+      if (reallocate) {
+        infoIndices.reserve(transitions.size());
+        for (const auto& transition : transitions) {
+          const auto referencedInfo = std::find_if(
+              ttinfos.begin(),
+              ttinfos.end(),
+              [&](const date::expanded_ttinfo& candidate) {
+                return &candidate == transition.info;
+              });
+          if (referencedInfo == ttinfos.end()) {
+            throw std::runtime_error("transition references unknown ttinfo");
+          }
+          infoIndices.push_back(static_cast<size_t>(
+              std::distance(ttinfos.begin(), referencedInfo)));
+        }
       }
+
+      ttinfos.emplace_back(info.offset, info.abbrev, isDst);
+      if (reallocate) {
+        for (size_t i = 0; i < transitions.size(); ++i) {
+          transitions[i].info = &ttinfos[infoIndices[i]];
+        }
+      }
+      ttinfo = std::prev(ttinfos.end());
+    }
+
+    if (!transitions.empty() && transitions.back().timepoint >= time) {
+      throw std::runtime_error("non-increasing time zone transition");
+    }
+    transitions.emplace_back(time, &*ttinfo);
+  };
+
+  auto extendTransitionsUntil = [&](date::sys_seconds endTime) {
+    auto info =
+        result.__get_info_to_populate_transition(transitions.back().timepoint);
+    const auto max = date::sys_seconds::max();
+    while (transitions.back().timepoint < endTime && info.end < max) {
+      // info.end is the boundary at which the next state begins. Store that
+      // next state at the boundary, not at the end of the next state.
+      const auto nextTransition = info.end;
+      info = result.__get_info_to_populate_transition(nextTransition);
+      if (!(info.begin <= nextTransition && nextTransition < info.end)) {
+        throw std::runtime_error("invalid sys_info transition range");
+      }
+      addTransition(nextTransition, info);
+    }
+  };
+
+  if (continuations.size() > 1 &&
+      (std::holds_alternative<std::string>(
+           continuations[continuations.size() - 2].__rules) ||
+       std::holds_alternative<std::string>(
+           continuations[continuations.size() - 1].__rules))) {
+    const auto endTime =
+        __until_to_sys_seconds(continuations[continuations.size() - 2]) +
+        date::years(2);
+    if (endTime > transitions.back().timepoint) {
+      extendTransitionsUntil(endTime);
     }
   }
 
-  // If the last continuation uses forever rules (rules that alternate every year,
-  // like daylight savings time) make sure we have all the transitions populated for
-  // at least 2 years after the start of the forever rules.
-  if (continuations.back().__has_forever_rules) { 
-    const auto& foreverRules = continuations.back().__forever_rules;   
-    const auto endTime = __from_to_sys_seconds(continuations.back().__stdoff, *std::get<1>(foreverRules), std::get<0>(foreverRules)->__from + date::years(2));
+  // If the last continuation uses forever rules (rules that alternate every
+  // year, like daylight savings time) make sure we have all the transitions
+  // populated for at least 2 years after the start of the forever rules.
+  if (continuations.back().__has_forever_rules) {
+    const auto& foreverRules = continuations.back().__forever_rules;
+    const auto endTime = __from_to_sys_seconds(
+        continuations.back().__stdoff,
+        *std::get<1>(foreverRules),
+        std::get<0>(foreverRules)->__from + date::years(2));
     if (transitions.back().timepoint < endTime) {
-    auto sys_info = result.__get_info_to_populate_transition(transitions.back().timepoint);
-      while (transitions.back().timepoint < endTime) {
-        sys_info = result.__get_info_to_populate_transition(sys_info.end);
-        ttinfos.emplace_back(sys_info.offset, sys_info.abbrev, sys_info.save > std::chrono::minutes(0));
-        transitions.emplace_back(sys_info.end, &ttinfos.back());
-      }
+      extendTransitionsUntil(endTime);
     }
   }
 

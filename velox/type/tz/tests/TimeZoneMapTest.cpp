@@ -16,15 +16,142 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <stdexcept>
+#include <string_view>
+#include <vector>
+
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/external/date/date.h"
+#include "velox/external/tzdb/time_zone_private.h"
+#include "velox/external/tzdb/tzdb_list.h"
 #include "velox/type/tz/TimeZoneMap.h"
 
 namespace facebook::velox::tz {
 namespace {
 
 using namespace std::chrono;
+
+facebook::velox::tzdb::time_zone rebuildExternalTimeZoneFromTransition(
+    std::string_view name,
+    int64_t lastTransition) {
+  const auto* zone = facebook::velox::tzdb::locate_zone(name);
+  const auto& source = zone->__implementation();
+  auto implementation =
+      std::make_unique<facebook::velox::tzdb::time_zone::__impl>(source);
+
+  const auto& sourceTtinfos = source.ttinfos();
+  auto& clonedTtinfos = implementation->ttinfos();
+  auto& clonedTransitions = implementation->transitions();
+  for (auto& transition : clonedTransitions) {
+    const auto sourceInfo = std::find_if(
+        sourceTtinfos.begin(),
+        sourceTtinfos.end(),
+        [&](const facebook::velox::date::expanded_ttinfo& candidate) {
+          return &candidate == transition.info;
+        });
+    if (sourceInfo == sourceTtinfos.end()) {
+      throw std::runtime_error("transition references unknown ttinfo");
+    }
+    transition.info =
+        &clonedTtinfos[std::distance(sourceTtinfos.begin(), sourceInfo)];
+  }
+
+  const facebook::velox::date::sys_seconds cutoff{
+      seconds{lastTransition}};
+  clonedTransitions.erase(
+      std::upper_bound(
+          clonedTransitions.begin(),
+          clonedTransitions.end(),
+          cutoff,
+          [](const auto& time, const auto& transition) {
+            return time < transition.timepoint;
+          }),
+      clonedTransitions.end());
+  if (clonedTransitions.empty() ||
+      clonedTransitions.back().timepoint != cutoff) {
+    throw std::runtime_error("required transition is missing");
+  }
+
+  return facebook::velox::tzdb::time_zone::__create(
+      std::move(implementation));
+}
+
+const facebook::velox::date::transition& findExternalTransition(
+    const facebook::velox::tzdb::time_zone& zone,
+    int64_t timestamp) {
+  const facebook::velox::date::sys_seconds time{seconds{timestamp}};
+  const auto& transitions = zone.__implementation().transitions();
+  const auto transition = std::lower_bound(
+      transitions.begin(),
+      transitions.end(),
+      time,
+      [](const auto& candidate, const auto& value) {
+        return candidate.timepoint < value;
+      });
+  if (transition == transitions.end() || transition->timepoint != time) {
+    throw std::runtime_error("calculated transition is missing");
+  }
+  return *transition;
+}
+
+TEST(TimeZoneMapTest, externalTzdbRuleTransitions) {
+  struct ExpectedInfo {
+    std::string_view zone;
+    int64_t timestamp;
+    int64_t offset;
+    int64_t saveMinutes;
+    std::string_view abbrev;
+  };
+
+  const std::vector<ExpectedInfo> cases = {
+      {"Africa/Windhoek", 764200799, 7200, 0, "CAT"},
+      {"Africa/Windhoek", 764200800, 3600, 0, "WAT"},
+      {"Africa/Windhoek", 778640399, 3600, 0, "WAT"},
+      {"Africa/Windhoek", 778640400, 7200, 1, "CAT"},
+      {"Atlantic/Stanley", 1283666399, -14400, 0, "-04"},
+      {"Atlantic/Stanley", 1283666400, -10800, 0, "-03"},
+  };
+
+  for (const auto& expected : cases) {
+    const auto* zone = facebook::velox::tzdb::locate_zone(expected.zone);
+    const facebook::velox::date::sys_seconds time{
+        seconds{expected.timestamp}};
+    const auto info = zone->get_info(time);
+    EXPECT_LT(info.begin, info.end) << expected.zone;
+    EXPECT_LE(info.begin, time) << expected.zone;
+    EXPECT_GT(info.end, time) << expected.zone;
+    EXPECT_EQ(info.offset.count(), expected.offset) << expected.zone;
+    EXPECT_EQ(info.save.count(), expected.saveMinutes) << expected.zone;
+    EXPECT_EQ(info.abbrev, expected.abbrev) << expected.zone;
+  }
+}
+
+TEST(TimeZoneMapTest, externalTzdbRebuildsMissingTransitions) {
+  const auto windhoek =
+      rebuildExternalTimeZoneFromTransition("Africa/Windhoek", 1491091200);
+  const auto& windhoekDst = findExternalTransition(windhoek, 1504400400);
+  EXPECT_EQ(windhoekDst.info->offset, seconds{7200});
+  EXPECT_EQ(windhoekDst.info->abbrev, "CAT");
+  EXPECT_TRUE(windhoekDst.info->is_dst);
+
+  const auto& windhoekStandard =
+      findExternalTransition(windhoek, 1508796000);
+  EXPECT_EQ(windhoekStandard.info->offset, seconds{7200});
+  EXPECT_EQ(windhoekStandard.info->abbrev, "CAT");
+  EXPECT_FALSE(windhoekStandard.info->is_dst);
+
+  const auto stanley =
+      rebuildExternalTimeZoneFromTransition("Atlantic/Stanley", 1271566800);
+  const auto& stanleyStandard =
+      findExternalTransition(stanley, 1283666400);
+  EXPECT_EQ(stanleyStandard.info->offset, seconds{-10800});
+  EXPECT_EQ(stanleyStandard.info->abbrev, "-03");
+  EXPECT_FALSE(stanleyStandard.info->is_dst);
+}
 
 TEST(TimeZoneMapTest, locateZoneID) {
   auto locateZoneID = [&](std::string_view name) {
